@@ -261,6 +261,8 @@ def fetch_programs_context() -> str:
 # ---------------------------------------------------------------------------
 BIBLE_STUDY_PROMPT = """You are the JCC Bible Study Assistant for Jubilee Celebration Center - AFM.
 
+Today's date is {today}.
+
 You answer questions about a specific Bible study document shared with the group. Your answers MUST come only from the document below - do not add interpretation, outside scripture, or commentary.
 
 RULES:
@@ -284,13 +286,16 @@ Week of: {week_of}
 
 PROGRAMS_PROMPT = """You are the JCC Programs Assistant for Jubilee Celebration Center - AFM.
 
+Today's date is {today}. Use this when answering questions about "next", "upcoming", "past", or "today's" events.
+
 You answer questions about JCC's 2026 ministry programs, events, leads, goals, and activities. Your answers MUST come only from the programs information below.
 
 GUIDANCE:
 - Be specific. When asked about events, give the date, ministry, and format.
+- For "next" or "upcoming" events, only consider events with dates AFTER today's date ({today}). If asked "next Couples Ministry event" and the next one chronologically is in the past, say so and give the one after that. If all are in the past, say there are no upcoming events for that ministry.
 - When asked about a ministry's vision, mission, or goals, summarize from the notes.
-- Some questions are about people. Look across ALL ministries in the data - leads are listed at each ministry section. If a person appears as a lead of any ministry, mention that.
-- For example, if asked "Who is the Pastor?", note that Pastor Tabu Bere leads the Outreach Ministry, even though there is no separate "Pastor" entry.
+- Some questions are about people. Look across ALL ministries in the data - leads are listed at each ministry section. If a person appears as a lead of any ministry, mention that. For example, "Who is the Pastor?" - note that Pastor Tabu Bere leads the Outreach Ministry.
+- If the user asks about "Bible study" or a "Bible Study Ministry": there is no separate Bible Study Ministry in the JCC 2026 plans because Bible studies are presented rotationally by groups within the congregation, not run as a standalone ministry. Tell them this clearly and suggest they switch to "Bible Study" mode to ask about a specific week's study.
 - If the information truly is not in the data below, say:
   "I don't have that information in the 2026 plans. Please check with the relevant ministry lead."
 - Do not invent events, dates, or leads. Stick to the data.
@@ -310,6 +315,8 @@ def chat(message, history, mode, study_id):
     if not message or not message.strip():
         return "Please type a question."
 
+    today_str = date.today().isoformat()
+
     if mode == "Bible Study":
         study = get_bible_study(study_id) if study_id else None
         if not study:
@@ -318,6 +325,7 @@ def chat(message, history, mode, study_id):
                 "If the dropdown is empty, click Refresh or ask an admin to upload one."
             )
         system_prompt = BIBLE_STUDY_PROMPT.format(
+            today=today_str,
             title=study["title"],
             presenter=study.get("presenter") or "Not specified",
             week_of=study["week_of"],
@@ -328,7 +336,7 @@ def chat(message, history, mode, study_id):
             context = fetch_programs_context()
         except Exception as e:
             return f"Could not load programs data: {e}"
-        system_prompt = PROGRAMS_PROMPT.format(programs_context=context)
+        system_prompt = PROGRAMS_PROMPT.format(today=today_str, programs_context=context)
 
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
