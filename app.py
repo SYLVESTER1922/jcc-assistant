@@ -29,6 +29,7 @@ import gradio as gr
 from supabase import create_client, Client
 from openai import OpenAI
 from docx import Document
+from pptx import Presentation
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,42 @@ def parse_docx(file_path: str) -> str:
     return "\n\n".join(paragraphs)
 
 
+def parse_pptx(file_path: str) -> str:
+    """Extract plain text from a .pptx file, slide by slide."""
+    prs = Presentation(file_path)
+    sections = []
+    for i, slide in enumerate(prs.slides, start=1):
+        slide_lines = [f"## Slide {i}"]
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    txt = "".join(run.text for run in para.runs).strip()
+                    if txt:
+                        slide_lines.append(txt)
+            elif shape.shape_type == 19 and shape.has_table:  # table
+                for row in shape.table.rows:
+                    row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                    if row_text.strip():
+                        slide_lines.append(row_text)
+        if len(slide_lines) > 1:
+            sections.append("\n".join(slide_lines))
+    return "\n\n".join(sections)
+
+
+def parse_study_document(file_path: str) -> str:
+    """Route to the right parser based on file extension."""
+    lower = file_path.lower()
+    if lower.endswith(".docx"):
+        return parse_docx(file_path)
+    elif lower.endswith(".pptx"):
+        return parse_pptx(file_path)
+    else:
+        raise ValueError(
+            f"Unsupported file type: {file_path}. "
+            "Please upload a .docx or .pptx file."
+        )
+
+
 def upload_bible_study(
     file, title: str, presenter: str, week_of: str, password: str
 ) -> str:
@@ -89,14 +126,14 @@ def upload_bible_study(
     if password != ADMIN_PASSWORD:
         return "❌ Incorrect admin password."
     if not file:
-        return "❌ Please attach a .docx file."
+        return "❌ Please attach a .docx or .pptx file."
     if not title.strip():
         return "❌ Title is required."
     if not week_of:
         return "❌ Week-of date is required."
 
     try:
-        text = parse_docx(file.name)
+        text = parse_study_document(file.name)
     except Exception as e:
         return f"❌ Could not parse the document: {e}"
 
@@ -324,7 +361,10 @@ with gr.Blocks(
                     value=str(date.today()),
                 )
                 up_password = gr.Textbox(label="Admin Password", type="password")
-            up_file = gr.File(label="Bible Study Document (.docx)", file_types=[".docx"])
+            up_file = gr.File(
+                label="Bible Study Document (.docx or .pptx)",
+                file_types=[".docx", ".pptx"],
+            )
             up_button = gr.Button("Upload", variant="primary")
             up_status = gr.Markdown()
 
