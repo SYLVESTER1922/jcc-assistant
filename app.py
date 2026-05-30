@@ -586,9 +586,8 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
                     chatbot = gr.Chatbot(
                         type="messages",
                         height=560,
-                        avatar_images=(None, LOGO_DATA_URI or None),
+                        avatar_images=(None, str(LOGO_PATH) if LOGO_PATH.exists() else None),
                         show_label=False,
-                        bubble_full_width=False,
                     )
                     msg = gr.Textbox(
                         placeholder="Ask a question…",
