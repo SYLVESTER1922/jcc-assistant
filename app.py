@@ -5,8 +5,11 @@ Jubilee Celebration Center - AFM.
 """
 
 import os
+import re
 import json
 import base64
+import urllib.parse
+import urllib.request
 from datetime import date
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -33,7 +36,7 @@ oai = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ---------------------------------------------------------------------------
-# Logo as base64 (so it inlines into the header HTML)
+# Logo as base64
 # ---------------------------------------------------------------------------
 LOGO_PATH = Path(__file__).parent / "jcc_logo.jpeg"
 if LOGO_PATH.exists():
@@ -80,6 +83,46 @@ def parse_study_document(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Scripture lookup
+# ---------------------------------------------------------------------------
+# Recognize patterns like "John 3:16", "1 Corinthians 13:4-7", "Psalm 119:11"
+SCRIPTURE_REGEX = re.compile(
+    r"\b("
+    r"(?:[123]\s*)?"               # optional book number like "1 ", "2 ", "3 "
+    r"(?:[A-Z][a-zA-Z]+)"          # book name
+    r"\s+\d+:\d+(?:[-\u2013]\d+)?" # chapter:verse(-verse)
+    r")\b"
+)
+
+
+def lookup_scripture(reference: str, translation: str = "kjv") -> Optional[str]:
+    """Fetch verse text from bible-api.com. Returns text or None on failure."""
+    try:
+        ref_clean = reference.replace("\u2013", "-").strip()
+        url = f"https://bible-api.com/{urllib.parse.quote(ref_clean)}?translation={translation}"
+        req = urllib.request.Request(url, headers={"User-Agent": "JCC-Assistant/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        text = (data.get("text") or "").strip()
+        if text:
+            return text
+    except Exception as e:
+        print(f"Scripture lookup failed for '{reference}': {e}")
+    return None
+
+
+def find_scriptures_in_text(text: str) -> List[str]:
+    """Extract unique scripture references from text."""
+    matches = SCRIPTURE_REGEX.findall(text)
+    seen = []
+    for m in matches:
+        m_clean = re.sub(r"\s+", " ", m).strip()
+        if m_clean and m_clean not in seen:
+            seen.append(m_clean)
+    return seen
+
+
+# ---------------------------------------------------------------------------
 # Suggested questions generator
 # ---------------------------------------------------------------------------
 SUGGEST_PROMPT = """Below is a Bible study document. Generate exactly 5 short, specific questions a group member might ask about THIS study after reading it.
@@ -88,7 +131,7 @@ Rules:
 - Each question is 4-10 words.
 - Questions must be answerable from the document content.
 - Cover different sections / angles (not all the same topic).
-- No generic Bible questions like "What does the Bible say about faith?" - they must be specific to this study.
+- No generic Bible questions - they must be specific to this study.
 
 Return a JSON array of 5 strings only. No preamble, no markdown, no code fences. Example:
 ["What does the study teach about X?", "What scriptures support Y?", ...]
@@ -99,7 +142,6 @@ STUDY DOCUMENT:
 
 
 def generate_suggested_questions(document_text: str) -> list:
-    """Generate 5 study-specific questions. Returns [] on failure."""
     try:
         resp = oai.chat.completions.create(
             model=OPENAI_MODEL,
@@ -107,7 +149,6 @@ def generate_suggested_questions(document_text: str) -> list:
             temperature=0.5,
         )
         raw = resp.choices[0].message.content.strip()
-        # strip code fences if model added them
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -126,7 +167,7 @@ PROGRAMS_SUGGESTED = [
     "What is the vision for Praise & Worship?",
     "What fundraising activities are planned for 2026?",
     "Who leads the Outreach Ministry?",
-    "What events are happening in May 2026?",
+    "What events are happening this month?",
 ]
 
 
@@ -173,10 +214,8 @@ def upload_bible_study(file, title, presenter, week_of, password):
     if len(text) < 50:
         return "❌ The document looks empty after parsing."
 
-    # Generate 5 study-specific questions
     questions = generate_suggested_questions(text)
 
-    # Check for existing study with same week_of -> replace
     existing = sb.table("bible_studies").select("id").eq("week_of", week_of).execute()
     payload = {
         "title": title.strip(),
@@ -257,22 +296,22 @@ def fetch_programs_context() -> str:
 
 
 # ---------------------------------------------------------------------------
-# System prompts
+# System prompts (with follow-up + synonym handling)
 # ---------------------------------------------------------------------------
 BIBLE_STUDY_PROMPT = """You are the JCC Bible Study Assistant for Jubilee Celebration Center - AFM.
 
 Today's date is {today}.
 
-You answer questions about a specific Bible study document shared with the group. Your answers MUST come only from the document below - do not add interpretation, outside scripture, or commentary.
+You answer questions about the Bible study document below. Your answers MUST come only from the document - do not add interpretation, outside scripture, or commentary.
 
 RULES:
 - Quote directly from the document using quotation marks for the key passage.
-- Cite the section heading, number, or slide where the quote appears (e.g., "Section 7: Logos and Rhema" or "Slide 4").
-- If the question is not addressed in the document, say:
-  "This isn't covered in this week's study. Please bring it up with the group or the presenter."
+- Cite the section heading, number, or slide where the quote appears.
+- Treat follow-up questions as connected to the prior exchange. If the user previously asked about "main points" and follows up with "tell me more about [topic that appeared in your answer]", that topic IS in the document - dig into the relevant section and elaborate. Do NOT decline.
+- Match user phrasing to document content semantically. If they ask about a concept the document covers under a different word (e.g., they say "what is Logos?" and the doc has a section "Logos and Rhema"), treat that as a valid match and answer from that section.
+- Only respond with "This isn't covered in this week's study" when the topic GENUINELY isn't in the document at all.
 - Do not speculate or fill gaps with general Bible knowledge.
-- Keep answers focused. Concise is better than thorough.
-- Maintain a respectful, reverent tone appropriate for Bible study.
+- Keep answers focused.
 
 ---
 THIS WEEK'S BIBLE STUDY
@@ -288,18 +327,26 @@ PROGRAMS_PROMPT = """You are the JCC Programs Assistant for Jubilee Celebration 
 
 Today's date is {today}. Use this when answering questions about "next", "upcoming", "past", or "today's" events.
 
-You answer questions about JCC's 2026 ministry programs, events, leads, goals, and activities. Your answers MUST come only from the programs information below.
+You answer questions about JCC's 2026 ministry programs, events, leads, goals, and activities from the data below.
+
+SYNONYM AND SEMANTIC MAPPING (very important):
+- "Evangelism" / "missions" / "community service" → Outreach Ministry
+- "Music" / "worship team" / "choir" → Praise & Worship Ministry
+- "Men's group" / "brothers" → Men of God Ministry
+- "Ladies" / "women's group" / "sisters" → Women of God Ministry
+- "Marriage" / "married couples" → Couples Ministry
+- "Greeters" / "ushers" / "welcome team" → Hospitality Ministry
+- "Building" / "repairs" / "facilities" → Maintenance & Repair Ministry
+- "Money" / "donations" / "giving" → Fundraising Ministry
+Always recognize these synonyms and answer from the corresponding ministry's data.
 
 GUIDANCE:
 - Be specific. When asked about events, give the date, ministry, and format.
-- For "next" or "upcoming" events, only consider events with dates AFTER today's date ({today}). If asked "next Couples Ministry event" and the next one chronologically is in the past, say so and give the one after that. If all are in the past, say there are no upcoming events for that ministry.
-- When asked about a ministry's vision, mission, or goals, summarize from the notes.
-- Some questions are about people. Look across ALL ministries in the data - leads are listed at each ministry section. If a person appears as a lead of any ministry, mention that. For example, "Who is the Pastor?" - note that Pastor Tabu Bere leads the Outreach Ministry.
-- If the user asks about "Bible study" or a "Bible Study Ministry": there is no separate Bible Study Ministry in the JCC 2026 plans because Bible studies are presented rotationally by groups within the congregation, not run as a standalone ministry. Tell them this clearly and suggest they switch to "Bible Study" mode to ask about a specific week's study.
-- If the information truly is not in the data below, say:
-  "I don't have that information in the 2026 plans. Please check with the relevant ministry lead."
-- Do not invent events, dates, or leads. Stick to the data.
-- Keep answers focused and helpful.
+- For "next" or "upcoming" events, only consider events with dates AFTER today ({today}). If the next chronological event is in the past, skip it and give the next future one. If all are in the past, say there are no upcoming events for that ministry.
+- For questions about people, look across ALL ministries - leads are listed at each ministry section. Example: "Who is the Pastor?" → Pastor Tabu Bere leads the Outreach Ministry.
+- If asked about "Bible study" or a "Bible Study Ministry": there is no separate Bible Study Ministry - Bible studies are presented rotationally by groups within the congregation. Tell the user this and suggest they switch to "Bible Study" mode for content questions.
+- Only say "I don't have that information" when the topic GENUINELY isn't anywhere in the data, even by synonym.
+- Do not invent events, dates, or leads.
 
 ---
 JCC 2026 PROGRAMS DATA
@@ -355,12 +402,11 @@ def chat(message, history, mode, study_id):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic suggested questions for sidebar
+# Dynamic suggested questions
 # ---------------------------------------------------------------------------
 def get_suggestions(mode: str, study_id: str) -> List[str]:
     if mode == "Church Programs":
         return PROGRAMS_SUGGESTED
-    # Bible Study
     if not study_id:
         return ["(Select a study to see suggestions)"]
     try:
@@ -381,28 +427,28 @@ def get_suggestions(mode: str, study_id: str) -> List[str]:
         return []
 
 
-def refresh_studies_and_suggestions(mode):
-    options = list_bible_studies()
-    if not options:
-        suggestions = get_suggestions(mode, None)
-        return (
-            gr.update(choices=[], value=None),
-            *[gr.update(value=q, visible=True) for q in suggestions[:5]],
-            *[gr.update(visible=False) for _ in range(5 - len(suggestions))],
-        )
-    new_value = options[0][1]
-    suggestions = get_suggestions(mode, new_value)
-    visible_count = min(len(suggestions), 5)
-    updates = []
-    for i in range(5):
-        if i < visible_count:
-            updates.append(gr.update(value=suggestions[i], visible=True))
-        else:
-            updates.append(gr.update(visible=False))
-    return (gr.update(choices=options, value=new_value), *updates)
+def get_study_text(mode: str, study_id: str) -> str:
+    """Return the document text for the currently selected study (for the side panel)."""
+    if mode != "Bible Study" or not study_id:
+        return ""
+    try:
+        study = get_bible_study(study_id)
+        if not study:
+            return ""
+        title = study["title"]
+        presenter = study.get("presenter") or ""
+        week_of = study["week_of"]
+        header = f"### {title}\n\n**Week of:** {week_of}"
+        if presenter:
+            header += f"   ·   **Presenter:** {presenter}"
+        header += "\n\n---\n\n"
+        return header + study["document_text"]
+    except Exception as e:
+        return f"Error loading study text: {e}"
 
 
-def update_suggestions(mode, study_id):
+def update_after_change(mode, study_id):
+    """Update suggestions AND study text after mode or study changes."""
     suggestions = get_suggestions(mode, study_id)
     updates = []
     for i in range(5):
@@ -410,7 +456,53 @@ def update_suggestions(mode, study_id):
             updates.append(gr.update(value=suggestions[i], visible=True))
         else:
             updates.append(gr.update(visible=False))
-    return updates
+    study_text = get_study_text(mode, study_id)
+    text_visible = bool(study_text)
+    return (*updates, gr.update(value=study_text, visible=text_visible))
+
+
+def refresh_studies_full(mode):
+    options = list_bible_studies()
+    if not options:
+        suggestions = get_suggestions(mode, None)
+        sugg_updates = []
+        for i in range(5):
+            if i < len(suggestions):
+                sugg_updates.append(gr.update(value=suggestions[i], visible=True))
+            else:
+                sugg_updates.append(gr.update(visible=False))
+        return (
+            gr.update(choices=[], value=None),
+            *sugg_updates,
+            gr.update(value="", visible=False),
+        )
+    new_value = options[0][1]
+    suggestions = get_suggestions(mode, new_value)
+    sugg_updates = []
+    for i in range(5):
+        if i < len(suggestions):
+            sugg_updates.append(gr.update(value=suggestions[i], visible=True))
+        else:
+            sugg_updates.append(gr.update(visible=False))
+    study_text = get_study_text(mode, new_value)
+    return (
+        gr.update(choices=options, value=new_value),
+        *sugg_updates,
+        gr.update(value=study_text, visible=bool(study_text)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scripture lookup handler (Tier-1 fix: clicking refs in the chat is hard
+# in stock Gradio; we add a separate "look up a verse" input instead).
+# ---------------------------------------------------------------------------
+def lookup_scripture_ui(ref, translation):
+    if not ref or not ref.strip():
+        return "Type a verse reference like *John 3:16* or *Romans 10:17*."
+    text = lookup_scripture(ref.strip(), translation or "kjv")
+    if text is None:
+        return f"Could not find **{ref}** in the {translation.upper()} translation. Check the spelling and try again."
+    return f"**{ref}** ({translation.upper()})\n\n> {text}"
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +511,7 @@ def update_suggestions(mode, study_id):
 CUSTOM_CSS = """
 .gradio-container {
     font-family: 'Inter', 'Helvetica Neue', system-ui, sans-serif !important;
-    max-width: 1280px !important;
+    max-width: 1400px !important;
     margin: 0 auto !important;
 }
 #jcc-hero {
@@ -510,13 +602,23 @@ CUSTOM_CSS = """
     border-color: #1B2A4E !important;
     transform: translateX(2px);
 }
-.tab-nav button {
-    font-weight: 500 !important;
-}
+.tab-nav button { font-weight: 500 !important; }
 .tab-nav button.selected {
     color: #1B2A4E !important;
     border-bottom-color: #C9A55C !important;
 }
+#study-text-panel {
+    background: #fefcf7;
+    border: 1px solid #e8dfc7;
+    border-radius: 12px;
+    padding: 18px 20px;
+    max-height: 560px;
+    overflow-y: auto;
+    font-size: 0.92em;
+    line-height: 1.55;
+    color: #1f2937;
+}
+#study-text-panel h3 { color: #1B2A4E; margin-top: 0; }
 footer { display: none !important; }
 """
 
@@ -538,9 +640,6 @@ theme = gr.themes.Soft(
 
 with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
 
-    # ============================================================
-    # HERO HEADER with logo
-    # ============================================================
     logo_img_html = (
         f'<img class="logo" src="{LOGO_DATA_URI}" alt="JCC Logo"/>'
         if LOGO_DATA_URI else ""
@@ -563,7 +662,7 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
         with gr.Tab("Chat"):
             with gr.Row():
                 # LEFT SIDEBAR
-                with gr.Column(scale=1, min_width=260):
+                with gr.Column(scale=1, min_width=240):
                     with gr.Group(elem_classes=["sidebar-card"]):
                         gr.HTML("<h3>Mode</h3>")
                         mode = gr.Radio(
@@ -590,12 +689,13 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
                         ]
 
                 # MAIN CHAT
-                with gr.Column(scale=3):
+                with gr.Column(scale=2):
                     chatbot = gr.Chatbot(
                         type="messages",
                         height=560,
                         avatar_images=(None, str(LOGO_PATH) if LOGO_PATH.exists() else None),
                         show_label=False,
+                        show_copy_button=True,
                     )
                     msg = gr.Textbox(
                         placeholder="Ask a question…",
@@ -603,6 +703,16 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
                         container=False,
                         autofocus=True,
                     )
+
+                # RIGHT PANEL: study document text
+                with gr.Column(scale=2):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Study Document</h3>")
+                        study_text_display = gr.Markdown(
+                            value="",
+                            elem_id="study-text-panel",
+                            visible=False,
+                        )
 
             # ---------- chat plumbing ----------
             def respond(message, history, mode_val, study_id):
@@ -634,28 +744,72 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
                     outputs=[chatbot],
                 )
 
-            # When mode or study changes, refresh suggestions
+            # Mode/study changes update suggestions AND study text
             mode.change(
-                fn=update_suggestions,
+                fn=update_after_change,
                 inputs=[mode, study_dropdown],
-                outputs=suggest_btns,
+                outputs=[*suggest_btns, study_text_display],
             )
             study_dropdown.change(
-                fn=update_suggestions,
+                fn=update_after_change,
                 inputs=[mode, study_dropdown],
-                outputs=suggest_btns,
+                outputs=[*suggest_btns, study_text_display],
             )
             refresh_btn.click(
-                fn=refresh_studies_and_suggestions,
+                fn=refresh_studies_full,
                 inputs=[mode],
-                outputs=[study_dropdown, *suggest_btns],
+                outputs=[study_dropdown, *suggest_btns, study_text_display],
             )
 
-            # Init suggestions on load
+            # Init on load
             demo.load(
-                fn=update_suggestions,
+                fn=update_after_change,
                 inputs=[mode, study_dropdown],
-                outputs=suggest_btns,
+                outputs=[*suggest_btns, study_text_display],
+            )
+
+        # ============================================================
+        # SCRIPTURE LOOKUP TAB
+        # ============================================================
+        with gr.Tab("Scripture Lookup"):
+            gr.Markdown(
+                "### Look up a Bible verse\n"
+                "Type a reference like `John 3:16`, `Romans 10:17`, `1 Corinthians 13:4-7`, or `Psalm 119:11`."
+            )
+            with gr.Row():
+                ref_input = gr.Textbox(
+                    label="Verse reference",
+                    placeholder="e.g. John 1:1-3",
+                    scale=3,
+                )
+                translation_choice = gr.Dropdown(
+                    label="Translation",
+                    choices=[
+                        ("King James Version (KJV)", "kjv"),
+                        ("World English Bible (WEB)", "web"),
+                        ("American Standard Version (ASV)", "asv"),
+                        ("Berean Standard Bible (BSB)", "bsb"),
+                    ],
+                    value="kjv",
+                    scale=1,
+                )
+            lookup_btn = gr.Button("Look up verse", variant="primary")
+            verse_output = gr.Markdown()
+
+            lookup_btn.click(
+                fn=lookup_scripture_ui,
+                inputs=[ref_input, translation_choice],
+                outputs=verse_output,
+            )
+            ref_input.submit(
+                fn=lookup_scripture_ui,
+                inputs=[ref_input, translation_choice],
+                outputs=verse_output,
+            )
+
+            gr.Markdown(
+                "---\n*Powered by bible-api.com. NIV/NKJV translations require a paid API "
+                "and are not available here. KJV, WEB, ASV, and BSB are free.*"
             )
 
         # ============================================================
