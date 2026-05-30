@@ -1,11 +1,14 @@
 """
 JCC Assistant - Bible Study & Church Programs Chatbot
 ======================================================
-A Gradio app for Jubilee Celebration Center - AFM.
+Jubilee Celebration Center - AFM.
 """
 
 import os
+import json
+import base64
 from datetime import date
+from pathlib import Path
 from typing import List, Tuple, Optional
 
 import gradio as gr
@@ -27,6 +30,18 @@ OPENAI_MODEL = "gpt-4o-mini"
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 oai = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Logo as base64 (so it inlines into the header HTML)
+# ---------------------------------------------------------------------------
+LOGO_PATH = Path(__file__).parent / "jcc_logo.jpeg"
+if LOGO_PATH.exists():
+    with open(LOGO_PATH, "rb") as f:
+        LOGO_B64 = base64.b64encode(f.read()).decode("ascii")
+    LOGO_DATA_URI = f"data:image/jpeg;base64,{LOGO_B64}"
+else:
+    LOGO_DATA_URI = ""
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +80,60 @@ def parse_study_document(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Suggested questions generator
+# ---------------------------------------------------------------------------
+SUGGEST_PROMPT = """Below is a Bible study document. Generate exactly 5 short, specific questions a group member might ask about THIS study after reading it.
+
+Rules:
+- Each question is 4-10 words.
+- Questions must be answerable from the document content.
+- Cover different sections / angles (not all the same topic).
+- No generic Bible questions like "What does the Bible say about faith?" - they must be specific to this study.
+
+Return a JSON array of 5 strings only. No preamble, no markdown, no code fences. Example:
+["What does the study teach about X?", "What scriptures support Y?", ...]
+
+STUDY DOCUMENT:
+{document_text}
+"""
+
+
+def generate_suggested_questions(document_text: str) -> list:
+    """Generate 5 study-specific questions. Returns [] on failure."""
+    try:
+        resp = oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": SUGGEST_PROMPT.format(document_text=document_text)}],
+            temperature=0.5,
+        )
+        raw = resp.choices[0].message.content.strip()
+        # strip code fences if model added them
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        questions = json.loads(raw)
+        if isinstance(questions, list):
+            return [str(q) for q in questions[:5]]
+    except Exception as e:
+        print(f"Question generation failed: {e}")
+    return []
+
+
+PROGRAMS_SUGGESTED = [
+    "When is the next Couples Ministry event?",
+    "What is the vision for Praise & Worship?",
+    "What fundraising activities are planned for 2026?",
+    "Who leads the Outreach Ministry?",
+    "What events are happening in May 2026?",
+]
+
+
+# ---------------------------------------------------------------------------
 # Bible Study DB helpers
 # ---------------------------------------------------------------------------
 def list_bible_studies() -> List[Tuple[str, str]]:
-    """Return list of (label, id) for the dropdown, newest first."""
     res = sb.table("bible_studies") \
         .select("id, week_of, title, presenter") \
         .order("week_of", desc=True) \
@@ -91,7 +156,6 @@ def get_bible_study(study_id: str) -> Optional[dict]:
 
 
 def upload_bible_study(file, title, presenter, week_of, password):
-    """Upload a Bible study. If a study with the same week_of exists, replace it."""
     if password != ADMIN_PASSWORD:
         return "❌ Incorrect admin password."
     if not file:
@@ -109,37 +173,40 @@ def upload_bible_study(file, title, presenter, week_of, password):
     if len(text) < 50:
         return "❌ The document looks empty after parsing."
 
-    # Check for existing study with same week_of -> replace it
+    # Generate 5 study-specific questions
+    questions = generate_suggested_questions(text)
+
+    # Check for existing study with same week_of -> replace
     existing = sb.table("bible_studies").select("id").eq("week_of", week_of).execute()
+    payload = {
+        "title": title.strip(),
+        "presenter": (presenter or "").strip() or None,
+        "document_text": text,
+        "suggested_questions": questions,
+    }
+
     if existing.data:
         existing_id = existing.data[0]["id"]
         try:
-            sb.table("bible_studies").update({
-                "title": title.strip(),
-                "presenter": (presenter or "").strip() or None,
-                "document_text": text,
-            }).eq("id", existing_id).execute()
+            sb.table("bible_studies").update(payload).eq("id", existing_id).execute()
             return (
                 f"✅ Replaced existing study for week of {week_of} with **{title}**.\n\n"
-                f"Document length: {len(text):,} characters."
+                f"Document length: {len(text):,} characters. "
+                f"Generated {len(questions)} suggested questions."
             )
         except Exception as e:
             return f"❌ Database update failed: {e}"
 
-    # No existing -> insert new
+    payload["week_of"] = week_of
     try:
-        sb.table("bible_studies").insert({
-            "week_of": week_of,
-            "title": title.strip(),
-            "presenter": (presenter or "").strip() or None,
-            "document_text": text,
-        }).execute()
+        sb.table("bible_studies").insert(payload).execute()
     except Exception as e:
         return f"❌ Database insert failed: {e}"
 
     return (
         f"✅ Uploaded **{title}** for the week of {week_of}.\n\n"
-        f"Document length: {len(text):,} characters."
+        f"Document length: {len(text):,} characters. "
+        f"Generated {len(questions)} suggested questions."
     )
 
 
@@ -222,7 +289,7 @@ You answer questions about JCC's 2026 ministry programs, events, leads, goals, a
 GUIDANCE:
 - Be specific. When asked about events, give the date, ministry, and format.
 - When asked about a ministry's vision, mission, or goals, summarize from the notes.
-- Some questions are about people (e.g., "Who is Pastor Tabu Bere?"). Look across ALL ministries in the data - leads are listed at each ministry section. If a person appears as a lead of any ministry, mention that.
+- Some questions are about people. Look across ALL ministries in the data - leads are listed at each ministry section. If a person appears as a lead of any ministry, mention that.
 - For example, if asked "Who is the Pastor?", note that Pastor Tabu Bere leads the Outreach Ministry, even though there is no separate "Pastor" entry.
 - If the information truly is not in the data below, say:
   "I don't have that information in the 2026 plans. Please check with the relevant ministry lead."
@@ -248,7 +315,7 @@ def chat(message, history, mode, study_id):
         if not study:
             return (
                 "Please select a Bible study from the dropdown first. "
-                "If the dropdown is empty, click the refresh button or ask an admin to upload one."
+                "If the dropdown is empty, click Refresh or ask an admin to upload one."
             )
         system_prompt = BIBLE_STUDY_PROMPT.format(
             title=study["title"],
@@ -280,42 +347,160 @@ def chat(message, history, mode, study_id):
 
 
 # ---------------------------------------------------------------------------
-# UI
+# Dynamic suggested questions for sidebar
 # ---------------------------------------------------------------------------
-def refresh_studies():
+def get_suggestions(mode: str, study_id: str) -> List[str]:
+    if mode == "Church Programs":
+        return PROGRAMS_SUGGESTED
+    # Bible Study
+    if not study_id:
+        return ["(Select a study to see suggestions)"]
+    try:
+        study = get_bible_study(study_id)
+        if study and study.get("suggested_questions"):
+            qs = study["suggested_questions"]
+            if isinstance(qs, list) and qs:
+                return qs
+        return [
+            "What were the main points?",
+            "What scriptures are referenced?",
+            "Summarize the conclusion",
+            "What does the study say about the key topic?",
+            "What is the application for our lives?",
+        ]
+    except Exception as e:
+        print(f"get_suggestions failed: {e}")
+        return []
+
+
+def refresh_studies_and_suggestions(mode):
     options = list_bible_studies()
     if not options:
-        return gr.update(choices=[], value=None)
-    return gr.update(choices=options, value=options[0][1])
+        suggestions = get_suggestions(mode, None)
+        return (
+            gr.update(choices=[], value=None),
+            *[gr.update(value=q, visible=True) for q in suggestions[:5]],
+            *[gr.update(visible=False) for _ in range(5 - len(suggestions))],
+        )
+    new_value = options[0][1]
+    suggestions = get_suggestions(mode, new_value)
+    visible_count = min(len(suggestions), 5)
+    updates = []
+    for i in range(5):
+        if i < visible_count:
+            updates.append(gr.update(value=suggestions[i], visible=True))
+        else:
+            updates.append(gr.update(visible=False))
+    return (gr.update(choices=options, value=new_value), *updates)
 
 
+def update_suggestions(mode, study_id):
+    suggestions = get_suggestions(mode, study_id)
+    updates = []
+    for i in range(5):
+        if i < len(suggestions):
+            updates.append(gr.update(value=suggestions[i], visible=True))
+        else:
+            updates.append(gr.update(visible=False))
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 CUSTOM_CSS = """
 .gradio-container {
     font-family: 'Inter', 'Helvetica Neue', system-ui, sans-serif !important;
-    max-width: 1100px !important;
+    max-width: 1280px !important;
     margin: 0 auto !important;
 }
-#app-header {
-    border-bottom: 1px solid #e5e7eb;
-    padding-bottom: 12px;
-    margin-bottom: 8px;
+#jcc-hero {
+    background: linear-gradient(135deg, #1B2A4E 0%, #2C4170 100%);
+    border-radius: 16px;
+    padding: 28px 32px;
+    margin-bottom: 18px;
+    color: white;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    box-shadow: 0 8px 24px rgba(27, 42, 78, 0.18);
+    position: relative;
+    overflow: hidden;
 }
-#app-header h1 {
-    color: #1B2A4E;
+#jcc-hero::after {
+    content: "";
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 4px;
+    background: linear-gradient(90deg, #C9A55C 0%, #E4CC8E 50%, #C9A55C 100%);
+}
+#jcc-hero img.logo {
+    width: 88px;
+    height: 88px;
+    border-radius: 50%;
+    background: white;
+    padding: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    flex-shrink: 0;
+}
+#jcc-hero .titles h1 {
+    font-size: 1.9em !important;
+    font-weight: 700 !important;
     margin: 0 0 4px 0 !important;
-    font-size: 1.8em !important;
-    font-weight: 700;
+    color: white !important;
+    letter-spacing: -0.5px;
 }
-#app-header .subtitle {
-    color: #6b7280;
+#jcc-hero .titles .church-name {
+    font-size: 0.85em;
+    color: #C9A55C;
+    letter-spacing: 3px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+}
+#jcc-hero .titles .tagline {
     font-size: 0.95em;
+    color: #cbd5e1;
     margin: 0;
 }
-#app-header .gold-bar {
-    width: 50px;
-    height: 3px;
-    background: #C9A55C;
-    margin: 8px 0;
+.sidebar-card {
+    background: white;
+    border-radius: 12px;
+    padding: 16px;
+    border: 1px solid #e5e7eb;
+    margin-bottom: 12px;
+}
+.sidebar-card h3 {
+    color: #1B2A4E;
+    font-size: 0.78em;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin: 0 0 12px 0;
+    font-weight: 700;
+    border-left: 3px solid #C9A55C;
+    padding-left: 10px;
+}
+.suggest-btn button {
+    background: white !important;
+    border: 1px solid #e5e7eb !important;
+    color: #1B2A4E !important;
+    text-align: left !important;
+    font-weight: 500 !important;
+    font-size: 0.88em !important;
+    padding: 10px 12px !important;
+    line-height: 1.35 !important;
+    white-space: normal !important;
+    height: auto !important;
+    min-height: 40px !important;
+    transition: all 0.15s ease;
+    width: 100% !important;
+    justify-content: flex-start !important;
+}
+.suggest-btn button:hover {
+    background: #1B2A4E !important;
+    color: white !important;
+    border-color: #1B2A4E !important;
+    transform: translateX(2px);
 }
 .tab-nav button {
     font-weight: 500 !important;
@@ -324,9 +509,7 @@ CUSTOM_CSS = """
     color: #1B2A4E !important;
     border-bottom-color: #C9A55C !important;
 }
-footer {
-    display: none !important;
-}
+footer { display: none !important; }
 """
 
 
@@ -347,11 +530,21 @@ theme = gr.themes.Soft(
 
 with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
 
-    gr.HTML("""
-    <div id="app-header">
-        <h1>JCC Assistant</h1>
-        <div class="gold-bar"></div>
-        <p class="subtitle">Jubilee Celebration Center — AFM &nbsp;·&nbsp; Bible Study &amp; Ministry Programs</p>
+    # ============================================================
+    # HERO HEADER with logo
+    # ============================================================
+    logo_img_html = (
+        f'<img class="logo" src="{LOGO_DATA_URI}" alt="JCC Logo"/>'
+        if LOGO_DATA_URI else ""
+    )
+    gr.HTML(f"""
+    <div id="jcc-hero">
+        {logo_img_html}
+        <div class="titles">
+            <div class="church-name">Jubilee Celebration Center &mdash; AFM</div>
+            <h1>JCC Assistant</h1>
+            <p class="tagline">Ask about this week's Bible study or church programs and events for 2026.</p>
+        </div>
     </div>
     """)
 
@@ -360,36 +553,102 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
         # CHAT TAB
         # ============================================================
         with gr.Tab("Chat"):
-            with gr.Row(equal_height=True):
-                mode = gr.Radio(
-                    choices=["Bible Study", "Church Programs"],
-                    value="Bible Study",
-                    label="Mode",
-                    container=True,
-                    scale=2,
-                )
-                study_dropdown = gr.Dropdown(
-                    label="Select Bible Study",
-                    choices=list_bible_studies(),
-                    container=True,
-                    scale=4,
-                )
-                refresh_btn = gr.Button("Refresh", scale=1, size="sm")
+            with gr.Row():
+                # LEFT SIDEBAR
+                with gr.Column(scale=1, min_width=260):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Mode</h3>")
+                        mode = gr.Radio(
+                            choices=["Bible Study", "Church Programs"],
+                            value="Bible Study",
+                            show_label=False,
+                            container=False,
+                        )
 
-            refresh_btn.click(fn=refresh_studies, outputs=study_dropdown)
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Bible Study</h3>")
+                        study_dropdown = gr.Dropdown(
+                            choices=list_bible_studies(),
+                            show_label=False,
+                            container=False,
+                        )
+                        refresh_btn = gr.Button("Refresh list", size="sm")
 
-            gr.ChatInterface(
-                fn=chat,
-                additional_inputs=[mode, study_dropdown],
-                type="messages",
-                examples=[
-                    ["What does the study say about the main idea?"],
-                    ["What scriptures are referenced?"],
-                    ["What were the main points?"],
-                    ["When is the next Couples Ministry event?"],
-                    ["What's the vision for Praise & Worship?"],
-                    ["What fundraising activities are planned for 2026?"],
-                ],
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Suggested Questions</h3>")
+                        suggest_btns = [
+                            gr.Button("", elem_classes=["suggest-btn"], visible=False)
+                            for _ in range(5)
+                        ]
+
+                # MAIN CHAT
+                with gr.Column(scale=3):
+                    chatbot = gr.Chatbot(
+                        type="messages",
+                        height=560,
+                        avatar_images=(None, LOGO_DATA_URI or None),
+                        show_label=False,
+                        bubble_full_width=False,
+                    )
+                    msg = gr.Textbox(
+                        placeholder="Ask a question…",
+                        show_label=False,
+                        container=False,
+                        autofocus=True,
+                    )
+
+            # ---------- chat plumbing ----------
+            def respond(message, history, mode_val, study_id):
+                if not message or not message.strip():
+                    return "", history
+                history = history + [{"role": "user", "content": message}]
+                reply = chat(message, history[:-1], mode_val, study_id)
+                history = history + [{"role": "assistant", "content": reply}]
+                return "", history
+
+            msg.submit(
+                respond,
+                inputs=[msg, chatbot, mode, study_dropdown],
+                outputs=[msg, chatbot],
+            )
+
+            def send_suggested(question, history, mode_val, study_id):
+                if not question or not question.strip():
+                    return history
+                history = history + [{"role": "user", "content": question}]
+                reply = chat(question, history[:-1], mode_val, study_id)
+                history = history + [{"role": "assistant", "content": reply}]
+                return history
+
+            for btn in suggest_btns:
+                btn.click(
+                    fn=send_suggested,
+                    inputs=[btn, chatbot, mode, study_dropdown],
+                    outputs=[chatbot],
+                )
+
+            # When mode or study changes, refresh suggestions
+            mode.change(
+                fn=update_suggestions,
+                inputs=[mode, study_dropdown],
+                outputs=suggest_btns,
+            )
+            study_dropdown.change(
+                fn=update_suggestions,
+                inputs=[mode, study_dropdown],
+                outputs=suggest_btns,
+            )
+            refresh_btn.click(
+                fn=refresh_studies_and_suggestions,
+                inputs=[mode],
+                outputs=[study_dropdown, *suggest_btns],
+            )
+
+            # Init suggestions on load
+            demo.load(
+                fn=update_suggestions,
+                inputs=[mode, study_dropdown],
+                outputs=suggest_btns,
             )
 
         # ============================================================
@@ -399,7 +658,8 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
             gr.Markdown(
                 "### Upload a Bible Study\n"
                 "Accepts `.docx` or `.pptx` files. "
-                "If a study already exists for the same week-of date, it will be **replaced**."
+                "If a study already exists for the same week-of date, it will be **replaced**. "
+                "Five suggested questions are auto-generated for each upload."
             )
 
             with gr.Row():
@@ -451,16 +711,20 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
             del_button = gr.Button("Delete Selected", variant="stop")
             del_status = gr.Markdown()
 
-            del_refresh.click(fn=refresh_studies, outputs=del_dropdown)
+            def refresh_del():
+                options = list_bible_studies()
+                return gr.update(choices=options, value=options[0][1] if options else None)
+
+            del_refresh.click(fn=refresh_del, outputs=del_dropdown)
             del_button.click(
                 fn=delete_bible_study,
                 inputs=[del_dropdown, del_password],
                 outputs=[del_status, del_dropdown],
             )
 
-    gr.Markdown(
+    gr.HTML(
         "<div style='text-align:center; color:#9ca3af; font-size:0.85em; padding:12px;'>"
-        "JCC Assistant — Prototype · The bot only answers from loaded study and programs data."
+        "JCC Assistant - Prototype. The bot only answers from loaded study and programs data."
         "</div>"
     )
 
