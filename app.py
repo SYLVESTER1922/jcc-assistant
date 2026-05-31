@@ -646,20 +646,17 @@ CUSTOM_CSS = """
 #netrisyl-footer .powered-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    opacity: 0.78;
-    transition: opacity 0.2s ease;
+    gap: 12px;
 }
-#netrisyl-footer .powered-row:hover { opacity: 1; }
 #netrisyl-footer .powered-row .label {
-    font-size: 0.78em;
+    font-size: 0.85em;
     color: #6b7280;
-    letter-spacing: 1.5px;
+    letter-spacing: 2px;
     text-transform: uppercase;
-    font-weight: 500;
+    font-weight: 600;
 }
 #netrisyl-footer .powered-row img {
-    height: 36px;
+    height: 64px;
     width: auto;
     display: block;
 }
