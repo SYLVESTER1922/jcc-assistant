@@ -46,6 +46,14 @@ if LOGO_PATH.exists():
 else:
     LOGO_DATA_URI = ""
 
+NETRISYL_LOGO_PATH = Path(__file__).parent / "netrisyl_logo.png"
+if NETRISYL_LOGO_PATH.exists():
+    with open(NETRISYL_LOGO_PATH, "rb") as f:
+        NETRISYL_B64 = base64.b64encode(f.read()).decode("ascii")
+    NETRISYL_DATA_URI = f"data:image/png;base64,{NETRISYL_B64}"
+else:
+    NETRISYL_DATA_URI = ""
+
 
 # ---------------------------------------------------------------------------
 # Document parsing
@@ -619,6 +627,42 @@ CUSTOM_CSS = """
     color: #1f2937;
 }
 #study-text-panel h3 { color: #1B2A4E; margin-top: 0; }
+
+#netrisyl-footer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 22px 12px 14px 12px;
+    margin-top: 8px;
+    border-top: 1px solid #e8e1cf;
+}
+#netrisyl-footer .prototype-note {
+    color: #9ca3af;
+    font-size: 0.8em;
+    text-align: center;
+    margin: 0;
+}
+#netrisyl-footer .powered-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    opacity: 0.78;
+    transition: opacity 0.2s ease;
+}
+#netrisyl-footer .powered-row:hover { opacity: 1; }
+#netrisyl-footer .powered-row .label {
+    font-size: 0.78em;
+    color: #6b7280;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    font-weight: 500;
+}
+#netrisyl-footer .powered-row img {
+    height: 36px;
+    width: auto;
+    display: block;
+}
 footer { display: none !important; }
 """
 
@@ -883,11 +927,19 @@ with gr.Blocks(title="JCC Assistant", theme=theme, css=CUSTOM_CSS) as demo:
                 outputs=[del_status, del_dropdown],
             )
 
-    gr.HTML(
-        "<div style='text-align:center; color:#9ca3af; font-size:0.85em; padding:12px;'>"
-        "JCC Assistant - Prototype. The bot only answers from loaded study and programs data."
-        "</div>"
+    netrisyl_img_html = (
+        f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl Insights"/>'
+        if NETRISYL_DATA_URI else ""
     )
+    gr.HTML(f"""
+    <div id="netrisyl-footer">
+        <p class="prototype-note">JCC Assistant &mdash; Prototype. The bot only answers from loaded study and programs data.</p>
+        <div class="powered-row">
+            <span class="label">Powered by</span>
+            {netrisyl_img_html}
+        </div>
+    </div>
+    """)
 
 
 if __name__ == "__main__":
