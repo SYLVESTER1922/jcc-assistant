@@ -200,8 +200,11 @@ def list_bible_studies() -> List[Tuple[str, str]]:
 def get_bible_study(study_id: str) -> Optional[dict]:
     if not study_id:
         return None
-    res = sb.table("bible_studies").select("*").eq("id", study_id).single().execute()
-    return res.data
+    try:
+        res = sb.table("bible_studies").select("*").eq("id", study_id).limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception:
+        return None
 
 
 def upload_bible_study(file, title, presenter, week_of, password):
@@ -452,7 +455,8 @@ def get_study_text(mode: str, study_id: str) -> str:
         header += "\n\n---\n\n"
         return header + study["document_text"]
     except Exception as e:
-        return f"Error loading study text: {e}"
+        print(f"get_study_text error: {e}")
+        return ""
 
 
 def update_after_change(mode, study_id):
